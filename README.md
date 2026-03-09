@@ -19,9 +19,9 @@ This tool is not officially supported. If you have any comments, please submit a
 
 ## Usage
 
-`--bam (-b)`: Input 10x Genomics BAM. This BAM must have the `CB` tag to define the barcodes of cell barcodes (or the tag defined by `--bam-tag`). Must also have an index (.bai) file. REQUIRED.
+`--bam (-b)`: Input 10x Genomics BAM/CRAM. This argument can be provided multiple times to process multiple files and merge the filtered output into a single BAM. Each input must have an index (`.bai`/`.crai`). REQUIRED.
 
-`--cell-barcodes (-c)`: A cell barcodes file as produced by Cell Ranger that defines which barcodes were called as cells. One barcode per line. In Cell Ranger runs, this can be found in the sub-folder `outs/filtered_gene_bc_matrices_mex/${refGenome}/barcodes.tsv` where `${refGenome}` is the name of the reference genome used in your Cell Ranger run. This file can be used as column labels for the output matrix. REQUIRED.
+`--cell-barcodes (-c)`: A barcode whitelist file. If one `--bam-tag` is provided (or default `CB` is used), this can be one barcode per line (backward compatible). If multiple `--bam-tag` values are provided, this file must have the same number of CSV columns as tags, where each row defines one tag-tuple that must match together. REQUIRED.
 
 `--out-bam (-o)`: A path to write the subsetted BAM file to. REQUIRED.
 
@@ -29,7 +29,7 @@ This tool is not officially supported. If you have any comments, please submit a
 
 `--log-level`: One of `info`, `error` or `debug`. Increasing levels of logging. DEFAULT: error.
 
-`--bam-tag`: Change this to use an alternative tag to the default `CB` tag. This can be useful for subsetting BAMs from LongRanger.
+`--bam-tag`: Can be provided multiple times. Reads are kept only if all requested tags are present and the full tuple of tag values appears in the barcode whitelist file. If omitted, defaults to `CB`.
 
 ## License
 `subset-bam` is licensed under the [MIT license](http://opensource.org/licenses/MIT). This project may not be copied, modified, or distributed except according to those terms.

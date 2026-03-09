@@ -2,21 +2,17 @@
 
 extern crate clap;
 extern crate csv;
-extern crate data_encoding;
 extern crate failure;
 extern crate rayon;
-extern crate ring;
 extern crate rust_htslib;
 extern crate simplelog;
 extern crate tempfile;
 extern crate terminal_size;
 #[macro_use]
 extern crate log;
-extern crate faccess;
 extern crate human_panic;
 
 use clap::{App, Arg};
-use faccess::{AccessMode, PathExt};
 use failure::Error;
 use rayon::prelude::*;
 use rust_htslib::bam;
@@ -26,8 +22,8 @@ use simplelog::*;
 use std::cmp;
 use std::collections::HashSet;
 use std::fs;
+use std::io;
 use std::io::prelude::*;
-use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process;
 use tempfile::tempdir;
@@ -43,7 +39,8 @@ fn get_args() -> clap::App<'static, 'static> {
              .short("b")
              .long("bam")
              .value_name("FILE")
-             .help("Cellranger BAM file.")
+             .multiple(true)
+             .help("Cellranger BAM/CRAM file. Repeat this argument to process multiple files.")
              .required(true))
         .arg(Arg::with_name("cell_barcodes")
              .short("c")
@@ -69,8 +66,8 @@ fn get_args() -> clap::App<'static, 'static> {
              .help("Number of cores to use. If larger than 1, will write BAM subsets to temporary files before merging."))
         .arg(Arg::with_name("bam_tag")
              .long("bam-tag")
-             .default_value("CB")
-             .help("Change from default value (CB) to subset alignments based on alternative tags."));
+             .multiple(true)
+             .help("Subset alignments based on one or more tags. If omitted, defaults to CB."));
     args
 }
 
@@ -87,16 +84,22 @@ pub struct Metrics {
 }
 
 pub struct ChunkArgs<'a> {
-    cell_barcodes: &'a HashSet<Vec<u8>>,
+    barcode_tuples: &'a HashSet<Vec<Vec<u8>>>,
+    bam_tags: &'a [String],
+    bam_index: usize,
     i: usize,
     bam_file: &'a str,
     tmp_dir: &'a Path,
-    bam_tag: String,
     virtual_start: Option<i64>,
     virtual_stop: Option<i64>,
 }
 
 pub struct ChunkOuts {
+    metrics: Metrics,
+    out_bam_file: PathBuf,
+}
+
+pub struct ProcessedBamOuts {
     metrics: Metrics,
     out_bam_file: PathBuf,
 }
@@ -112,7 +115,11 @@ fn main() {
 
 fn _main(cli_args: Vec<String>) {
     let args = get_args().get_matches_from(cli_args);
-    let bam_file = args.value_of("bam").expect("You must provide a BAM file");
+    let bam_files: Vec<String> = args
+        .values_of("bam")
+        .expect("You must provide at least one BAM/CRAM file")
+        .map(|s| s.to_string())
+        .collect();
     let cell_barcodes = args
         .value_of("cell_barcodes")
         .expect("You must provide a cell barcodes file");
@@ -125,7 +132,14 @@ fn _main(cli_args: Vec<String>) {
         .unwrap_or_default()
         .parse::<u64>()
         .expect("Failed to convert cores to integer");
-    let bam_tag = args.value_of("bam_tag").unwrap_or_default().to_string();
+    if cores == 0 {
+        error!("--cores must be >= 1");
+        process::exit(1);
+    }
+    let bam_tags: Vec<String> = match args.values_of("bam_tag") {
+        Some(vals) => vals.map(|s| s.to_string()).collect(),
+        None => vec!["CB".to_string()],
+    };
 
     let ll = match ll {
         "info" => LevelFilter::Info,
@@ -138,34 +152,14 @@ fn _main(cli_args: Vec<String>) {
     };
     let _ = SimpleLogger::init(ll, Config::default());
 
-    check_inputs_exist(bam_file, cell_barcodes, out_bam_file);
-    let cell_barcodes = load_barcodes(&cell_barcodes).unwrap();
+    check_inputs_exist(&bam_files, cell_barcodes, out_bam_file);
+    check_bam_headers_compatible(&bam_files);
+    let barcode_tuples = load_barcode_tuples(&cell_barcodes, bam_tags.len()).unwrap();
     let tmp_dir = tempdir().unwrap();
-    let virtual_offsets = bgzf_noffsets(&bam_file, &cores).unwrap();
-
-    let mut chunks = Vec::new();
-    for (i, (virtual_start, virtual_stop)) in virtual_offsets.iter().enumerate() {
-        let c = ChunkArgs {
-            cell_barcodes: &cell_barcodes,
-            i: i,
-            bam_file: &bam_file,
-            tmp_dir: tmp_dir.path(),
-            bam_tag: bam_tag.clone(),
-            virtual_start: *virtual_start,
-            virtual_stop: *virtual_stop,
-        };
-        chunks.push(c);
-    }
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(cores as usize)
         .build()
         .unwrap();
-    let results: Vec<_> = pool.install(|| {
-        chunks
-            .par_iter()
-            .map(|chunk| slice_bam_chunk(chunk))
-            .collect()
-    });
 
     // combine metrics
     let mut metrics = Metrics {
@@ -174,16 +168,19 @@ fn _main(cli_args: Vec<String>) {
         kept_reads: 0,
     };
 
-    fn add_metrics(metrics: &mut Metrics, m: &Metrics) {
-        metrics.total_reads += m.total_reads;
-        metrics.barcoded_reads += m.barcoded_reads;
-        metrics.kept_reads += m.kept_reads;
-    }
-
-    let mut tmp_bams = Vec::new();
-    for c in results.iter() {
-        add_metrics(&mut metrics, &c.metrics);
-        tmp_bams.push(&c.out_bam_file);
+    let mut filtered_bams = Vec::new();
+    for (bam_index, bam_file) in bam_files.iter().enumerate() {
+        let r = process_single_bam(
+            bam_file,
+            bam_index,
+            &barcode_tuples,
+            &bam_tags,
+            &cores,
+            tmp_dir.path(),
+            &pool,
+        );
+        add_metrics(&mut metrics, &r.metrics);
+        filtered_bams.push(r.out_bam_file);
     }
 
     if metrics.kept_reads == 0 {
@@ -191,12 +188,15 @@ fn _main(cli_args: Vec<String>) {
         process::exit(2);
     }
 
-    // just copy the temp file over
-    if cores == 1 {
-        fs::copy(tmp_bams[0], out_bam_file).unwrap();
+    if filtered_bams.len() == 1 {
+        fs::copy(&filtered_bams[0], out_bam_file).unwrap();
     } else {
-        info!("Merging {} BAM chunks into final output", cores);
-        merge_bams(tmp_bams, Path::new(out_bam_file));
+        info!(
+            "Merging {} filtered BAM files into final output",
+            filtered_bams.len()
+        );
+        let final_merge_inputs: Vec<&PathBuf> = filtered_bams.iter().collect();
+        merge_bams(final_merge_inputs, Path::new(out_bam_file));
     }
 
     info!("Done!");
@@ -206,12 +206,81 @@ fn _main(cli_args: Vec<String>) {
     );
 }
 
-pub fn check_inputs_exist(bam_file: &str, cell_barcodes: &str, out_bam_path: &str) {
-    for path in [bam_file, cell_barcodes].iter() {
-        if !Path::new(&path).exists() {
+fn add_metrics(metrics: &mut Metrics, m: &Metrics) {
+    metrics.total_reads += m.total_reads;
+    metrics.barcoded_reads += m.barcoded_reads;
+    metrics.kept_reads += m.kept_reads;
+}
+
+pub fn process_single_bam<'a>(
+    bam_file: &'a str,
+    bam_index: usize,
+    barcode_tuples: &'a HashSet<Vec<Vec<u8>>>,
+    bam_tags: &'a [String],
+    cores: &u64,
+    tmp_dir: &'a Path,
+    pool: &rayon::ThreadPool,
+) -> ProcessedBamOuts {
+    let virtual_offsets = bgzf_noffsets(bam_file, cores).unwrap();
+    let mut chunks = Vec::new();
+    for (i, (virtual_start, virtual_stop)) in virtual_offsets.iter().enumerate() {
+        let c = ChunkArgs {
+            barcode_tuples: barcode_tuples,
+            bam_tags: bam_tags,
+            bam_index: bam_index,
+            i: i,
+            bam_file: bam_file,
+            tmp_dir: tmp_dir,
+            virtual_start: *virtual_start,
+            virtual_stop: *virtual_stop,
+        };
+        chunks.push(c);
+    }
+    let results: Vec<_> = pool.install(|| {
+        chunks
+            .par_iter()
+            .map(|chunk| slice_bam_chunk(chunk))
+            .collect()
+    });
+
+    let mut metrics = Metrics {
+        total_reads: 0,
+        barcoded_reads: 0,
+        kept_reads: 0,
+    };
+    let mut tmp_bams = Vec::new();
+    for c in results.iter() {
+        add_metrics(&mut metrics, &c.metrics);
+        tmp_bams.push(&c.out_bam_file);
+    }
+
+    let out_bam_file = tmp_dir.join(format!("filtered_{}.bam", bam_index));
+    if *cores == 1 {
+        fs::copy(tmp_bams[0], &out_bam_file).unwrap();
+    } else {
+        info!("Merging {} BAM chunks for {}", tmp_bams.len(), bam_file);
+        merge_bams(tmp_bams, &out_bam_file);
+    }
+
+    ProcessedBamOuts {
+        metrics: metrics,
+        out_bam_file: out_bam_file,
+    }
+}
+
+pub fn check_inputs_exist(bam_files: &[String], cell_barcodes: &str, out_bam_path: &str) {
+    for path in bam_files {
+        if !Path::new(path).exists() {
             error!("File {} does not exist", path);
             process::exit(1);
         }
+    }
+    if !Path::new(cell_barcodes).exists() {
+        error!("File {} does not exist", cell_barcodes);
+        process::exit(1);
+    }
+    for bam_file in bam_files {
+        check_index_exists(bam_file);
     }
     let path = Path::new(out_bam_path);
     if path.exists() {
@@ -232,7 +301,9 @@ pub fn check_inputs_exist(bam_file: &str, cell_barcodes: &str, out_bam_path: &st
         error!("Output directory {:?} does not exist", parent_dir);
         process::exit(1);
     }
+}
 
+pub fn check_index_exists(bam_file: &str) {
     let extension = Path::new(bam_file).extension().unwrap().to_str().unwrap();
     match extension {
         "bam" => {
@@ -250,40 +321,86 @@ pub fn check_inputs_exist(bam_file: &str, cell_barcodes: &str, out_bam_path: &st
             }
         }
         &_ => {
-            error!("BAM file did not end in .bam or .cram. Unable to validate");
+            error!(
+                "BAM file {} did not end in .bam or .cram. Unable to validate",
+                bam_file
+            );
             process::exit(1);
         }
     }
 }
 
-pub fn load_barcodes(filename: impl AsRef<Path>) -> Result<HashSet<Vec<u8>>, Error> {
-    let r = fs::File::open(filename.as_ref())?;
-    let reader = BufReader::with_capacity(32 * 1024, r);
+pub fn check_bam_headers_compatible(bam_files: &[String]) {
+    use rust_htslib::bam::Read;
+    if bam_files.len() <= 1 {
+        return;
+    }
+    let bam = bam::Reader::from_path(&bam_files[0]).unwrap();
+    let template_header = bam.header().as_bytes().to_vec();
+    for bam_file in bam_files.iter().skip(1) {
+        let bam = bam::Reader::from_path(bam_file).unwrap();
+        if bam.header().as_bytes() != template_header.as_slice() {
+            error!(
+                "BAM headers are incompatible between {} and {}. Unable to merge into one output BAM.",
+                bam_files[0], bam_file
+            );
+            process::exit(1);
+        }
+    }
+}
 
+pub fn load_barcode_tuples(
+    filename: impl AsRef<Path>,
+    expected_columns: usize,
+) -> Result<HashSet<Vec<Vec<u8>>>, Error> {
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_path(filename.as_ref())?;
     let mut bc_set = HashSet::new();
-
-    for l in reader.lines() {
-        let seq = l?.into_bytes();
-        bc_set.insert(seq);
+    for (row_index, row) in rdr.records().enumerate() {
+        let record = row?;
+        if record.len() != expected_columns {
+            error!(
+                "Barcode row {} has {} columns but {} bam-tag values were provided.",
+                row_index + 1,
+                record.len(),
+                expected_columns
+            );
+            process::exit(1);
+        }
+        let mut tuple = Vec::with_capacity(expected_columns);
+        for col in 0..expected_columns {
+            let field = record.get(col).unwrap().trim();
+            if field.is_empty() {
+                error!(
+                    "Barcode row {} column {} is empty; each bam-tag column requires a barcode value.",
+                    row_index + 1,
+                    col + 1
+                );
+                process::exit(1);
+            }
+            tuple.push(field.as_bytes().to_vec());
+        }
+        bc_set.insert(tuple);
     }
     let num_bcs = bc_set.len();
     if num_bcs == 0 {
-        error!("Loaded 0 barcodes. Is your barcode file gzipped or empty?");
+        error!("Loaded 0 barcode tuples. Is your barcode file gzipped or empty?");
         process::exit(1);
     }
-    debug!("Loaded {} barcodes", num_bcs);
+    debug!("Loaded {} barcode tuples", num_bcs);
     Ok(bc_set)
 }
 
-pub fn get_cell_barcode(rec: &Record, bam_tag: &str) -> Option<Vec<u8>> {
-    //println!("{:?}", rec.aux(bam_tag.as_bytes()));
-    match rec.aux(bam_tag.as_bytes()) {
-        Some(Aux::String(hp)) => {
-            let cb = hp.to_vec();
-            Some(cb)
+pub fn get_barcode_tuple(rec: &Record, bam_tags: &[String]) -> Option<Vec<Vec<u8>>> {
+    let mut tuple = Vec::with_capacity(bam_tags.len());
+    for bam_tag in bam_tags.iter() {
+        match rec.aux(bam_tag.as_bytes()) {
+            Some(Aux::String(value)) => tuple.push(value.to_vec()),
+            _ => return None,
         }
-        _ => None,
     }
+    Some(tuple)
 }
 
 pub fn load_writer(bam: &bam::Reader, out_bam_path: &Path) -> Result<bam::Writer, Error> {
@@ -378,7 +495,9 @@ pub fn is_valid_bgzf_block(block: &[u8]) -> bool {
 
 pub fn slice_bam_chunk(args: &ChunkArgs) -> ChunkOuts {
     let mut bam = bam::Reader::from_path(args.bam_file).unwrap();
-    let out_bam_file = args.tmp_dir.join(format!("{}.bam", args.i));
+    let out_bam_file = args
+        .tmp_dir
+        .join(format!("{}_{}.bam", args.bam_index, args.i));
     let mut out_bam = load_writer(&bam, &out_bam_file).unwrap();
     let mut metrics = Metrics {
         total_reads: 0,
@@ -388,11 +507,10 @@ pub fn slice_bam_chunk(args: &ChunkArgs) -> ChunkOuts {
     for r in bam.iter_chunk(args.virtual_start, args.virtual_stop) {
         let rec = r.unwrap();
         metrics.total_reads += 1;
-        let barcode = get_cell_barcode(&rec, &args.bam_tag);
-        if barcode.is_some() {
+        let barcode = get_barcode_tuple(&rec, args.bam_tags);
+        if let Some(tuple) = barcode {
             metrics.barcoded_reads += 1;
-            let barcode = barcode.unwrap();
-            if args.cell_barcodes.contains(&barcode) {
+            if args.barcode_tuples.contains(&tuple) {
                 metrics.kept_reads += 1;
                 out_bam.write(&rec).unwrap();
             }
@@ -422,34 +540,56 @@ pub fn merge_bams(tmp_bams: Vec<&PathBuf>, out_bam_file: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use data_encoding::HEXUPPER;
-    use ring::digest::{Context, Digest, SHA256};
+    use rust_htslib::bam::Read as _;
+    use std::io::{BufRead, BufReader, Write};
     use tempfile::tempdir;
 
-    /// Compute digest value for given `Reader` and print it
-    /// This is taken from the Rust cookbook
-    /// https://rust-lang-nursery.github.io/rust-cookbook/cryptography/hashing.html
-    fn sha256_digest<R: Read>(mut reader: R) -> Result<Digest, Error> {
-        let mut context = Context::new(&SHA256);
-        let mut buffer = [0; 1024];
-
-        loop {
-            let count = reader.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            context.update(&buffer[..count]);
-        }
-
-        Ok(context.finish())
+    fn count_records(path: &str) -> usize {
+        let mut bam = bam::Reader::from_path(path).unwrap();
+        bam.records().count()
     }
 
     #[test]
     fn test_bam_single_core() {
-        let mut cmds = Vec::new();
         let tmp_dir = tempdir().unwrap();
-        let out_file = tmp_dir.path().join("result.bam");
-        let out_file = out_file.to_str().unwrap();
+        let out_file_1 = tmp_dir.path().join("result_1.bam");
+        let out_file_2 = tmp_dir.path().join("result_2.bam");
+        let out_file_1 = out_file_1.to_str().unwrap();
+        let out_file_2 = out_file_2.to_str().unwrap();
+
+        for out_file in [out_file_1, out_file_2].iter() {
+            let mut cmds = Vec::new();
+            for l in &[
+                "subset-bam",
+                "-b",
+                "test/test.bam",
+                "-c",
+                "test/barcodes.csv",
+                "-o",
+                out_file,
+                "--cores",
+                "1",
+            ] {
+                cmds.push(l.to_string());
+            }
+            _main(cmds);
+        }
+
+        let bytes_1 = fs::read(out_file_1).unwrap();
+        let bytes_2 = fs::read(out_file_2).unwrap();
+        assert_eq!(bytes_1, bytes_2);
+        assert!(count_records(out_file_1) > 0);
+    }
+
+    #[test]
+    fn test_multi_bam_single_output() {
+        let tmp_dir = tempdir().unwrap();
+        let baseline_out = tmp_dir.path().join("baseline.bam");
+        let merged_out = tmp_dir.path().join("merged.bam");
+        let baseline_out = baseline_out.to_str().unwrap();
+        let merged_out = merged_out.to_str().unwrap();
+
+        let mut baseline_cmds = Vec::new();
         for l in &[
             "subset-bam",
             "-b",
@@ -457,19 +597,92 @@ mod tests {
             "-c",
             "test/barcodes.csv",
             "-o",
-            out_file,
+            baseline_out,
             "--cores",
             "1",
         ] {
-            cmds.push(l.to_string());
+            baseline_cmds.push(l.to_string());
         }
-        _main(cmds);
-        let fh = fs::File::open(&out_file).unwrap();
-        let d = sha256_digest(fh).unwrap();
-        let d = HEXUPPER.encode(d.as_ref());
-        assert_eq!(
-            d,
-            "65061704E9C15BFC8FECF07D1DE527AF666E7623525262334C3FDC62F366A69E"
-        );
+        _main(baseline_cmds);
+
+        let mut merged_cmds = Vec::new();
+        for l in &[
+            "subset-bam",
+            "-b",
+            "test/test.bam",
+            "-b",
+            "test/test.bam",
+            "-c",
+            "test/barcodes.csv",
+            "-o",
+            merged_out,
+            "--cores",
+            "1",
+        ] {
+            merged_cmds.push(l.to_string());
+        }
+        _main(merged_cmds);
+
+        let baseline_records = count_records(baseline_out);
+        let merged_records = count_records(merged_out);
+        assert_eq!(merged_records, baseline_records * 2);
+    }
+
+    #[test]
+    fn test_multi_tag_tuple_match() {
+        let tmp_dir = tempdir().unwrap();
+        let baseline_out = tmp_dir.path().join("single_tag.bam");
+        let multi_tag_out = tmp_dir.path().join("multi_tag.bam");
+        let multi_tag_barcodes = tmp_dir.path().join("multi_tag_barcodes.csv");
+        let baseline_out = baseline_out.to_str().unwrap();
+        let multi_tag_out = multi_tag_out.to_str().unwrap();
+
+        let barcode_fh = fs::File::open("test/barcodes.csv").unwrap();
+        let mut writer = fs::File::create(&multi_tag_barcodes).unwrap();
+        let reader = BufReader::new(barcode_fh);
+        for line in reader.lines() {
+            let bc = line.unwrap();
+            writeln!(writer, "{0},{0}", bc).unwrap();
+        }
+
+        let mut baseline_cmds = Vec::new();
+        for l in &[
+            "subset-bam",
+            "-b",
+            "test/test.bam",
+            "-c",
+            "test/barcodes.csv",
+            "-o",
+            baseline_out,
+            "--cores",
+            "1",
+        ] {
+            baseline_cmds.push(l.to_string());
+        }
+        _main(baseline_cmds);
+
+        let mut multi_tag_cmds = Vec::new();
+        for l in &[
+            "subset-bam",
+            "-b",
+            "test/test.bam",
+            "--bam-tag",
+            "CB",
+            "--bam-tag",
+            "CB",
+            "-c",
+            multi_tag_barcodes.to_str().unwrap(),
+            "-o",
+            multi_tag_out,
+            "--cores",
+            "1",
+        ] {
+            multi_tag_cmds.push(l.to_string());
+        }
+        _main(multi_tag_cmds);
+
+        let baseline_records = count_records(baseline_out);
+        let multi_tag_records = count_records(multi_tag_out);
+        assert_eq!(baseline_records, multi_tag_records);
     }
 }
