@@ -67,6 +67,7 @@ fn get_args() -> clap::App<'static, 'static> {
         .arg(Arg::with_name("bam_tag")
              .long("bam-tag")
              .multiple(true)
+             .takes_value(true)
              .help("Subset alignments based on one or more tags. If omitted, defaults to CB."));
     args
 }
@@ -396,7 +397,7 @@ pub fn get_barcode_tuple(rec: &Record, bam_tags: &[String]) -> Option<Vec<Vec<u8
     let mut tuple = Vec::with_capacity(bam_tags.len());
     for bam_tag in bam_tags.iter() {
         match rec.aux(bam_tag.as_bytes()) {
-            Some(Aux::String(value)) => tuple.push(value.to_vec()),
+            Ok(Aux::String(value)) => tuple.push(value.as_bytes().to_vec()),
             _ => return None,
         }
     }
@@ -406,7 +407,7 @@ pub fn get_barcode_tuple(rec: &Record, bam_tags: &[String]) -> Option<Vec<Vec<u8
 pub fn load_writer(bam: &bam::Reader, out_bam_path: &Path) -> Result<bam::Writer, Error> {
     use rust_htslib::bam::Read; // collides with fs::Read
     let hdr = rust_htslib::bam::Header::from_template(bam.header());
-    let out_handle = bam::Writer::from_path(out_bam_path, &hdr)?;
+    let out_handle = bam::Writer::from_path(out_bam_path, &hdr, bam::Format::Bam)?;
     Ok(out_handle)
 }
 
